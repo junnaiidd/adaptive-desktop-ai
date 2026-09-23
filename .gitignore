@@ -37,3 +37,6 @@ Thumbs.db
 build/
 dist/
 *.egg-info/
+
+data/training_examples.json
+data/training_examples.json.tmp
