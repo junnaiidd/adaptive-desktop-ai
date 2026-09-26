@@ -134,6 +134,22 @@ class ActivityRepository:
             ).fetchall()
         return [_activity_from_row(row) for row in rows]
 
+    def list_activities_for_session(self, session_id: str) -> list[StoredActivity]:
+        """Return one session's activity segments in chronological order.
+
+        Uses the same ordering convention as :meth:`list_activities`
+        (chronological, oldest first) so downstream consumers -- such as
+        Phase 2A feature extraction -- see a session's activities in the
+        order they actually occurred. Returns an empty list if the
+        session has no recorded activity segments or does not exist.
+        """
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM activity_segments WHERE session_id = ? ORDER BY started_at_utc, id",
+                (session_id,),
+            ).fetchall()
+        return [_activity_from_row(row) for row in rows]
+
     def list_recent_activities(self, limit: int = 50) -> list[StoredActivity]:
         """Return the newest completed segments first for live dashboard presentation."""
         if limit <= 0:
