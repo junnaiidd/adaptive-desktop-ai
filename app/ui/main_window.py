@@ -16,17 +16,30 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.ml.context_observation_store import ContextObservationStore
+from app.ui.context_inference_worker import ContextInferenceWorker
+from app.ui.context_observation_coordinator import ContextObservationCoordinator
 from app.ui.dashboard_controller import DashboardController
 from app.ui.monitoring_worker import MonitoringWorker
+
+
+# How often to look for newly completed sessions that have no context observation yet.
+CONTEXT_INFERENCE_INTERVAL_MS = 30_000
 
 
 class MainWindow(QMainWindow):
     """The first native Activity interface, backed by the local monitoring service."""
 
-    def __init__(self, controller: DashboardController) -> None:
+    def __init__(
+        self,
+        controller: DashboardController,
+        context_coordinator: ContextObservationCoordinator | None = None,
+    ) -> None:
         super().__init__()
         self.controller = controller
+        self.context_coordinator = context_coordinator or self._build_default_coordinator(controller)
         self.worker: MonitoringWorker | None = None
+        self.inference_worker: ContextInferenceWorker | None = None
         self.setWindowTitle("Adaptive Desktop AI")
         self.resize(1180, 760)
         self.setMinimumSize(960, 640)
@@ -34,7 +47,29 @@ class MainWindow(QMainWindow):
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh)
         self._refresh_timer.start(1_000)
+        self._inference_timer = QTimer(self)
+        self._inference_timer.timeout.connect(self._run_context_inference)
+        self._inference_timer.start(CONTEXT_INFERENCE_INTERVAL_MS)
+        QTimer.singleShot(0, self._run_context_inference)  # one pass at startup, then every interval
         self.refresh()
+
+    @staticmethod
+    def _build_default_coordinator(controller: DashboardController) -> ContextObservationCoordinator:
+        """
+        Self-wire the context-observation integration when the caller
+        (e.g. `application.py`, unmodified by this milestone) does not
+        supply a coordinator explicitly. Reuses the SAME database file
+        `controller.repository` already points at, so the coordinator's
+        writes and the dashboard's reads always agree on one store --
+        and shares that one store with `controller` itself when it
+        wasn't given one, so the "Latest context" card reflects what the
+        coordinator actually persists.
+        """
+        store = controller.context_observation_store
+        if store is None:
+            store = ContextObservationStore(controller.repository.database_path)
+            controller.context_observation_store = store
+        return ContextObservationCoordinator(controller.repository, store)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -97,9 +132,11 @@ class MainWindow(QMainWindow):
         self.current_card, self.current_values = _card("Current activity", ("Application", "Process", "Window title", "Duration"))
         self.today_card, self.today_values = _card("Today", ("Observed", "Segments", "Sessions"))
         self.session_card, self.session_values = _card("Session", ("Status", "Duration", "Activities"))
+        self.context_card, self.context_values = _card("Latest context", ("Context", "Session", "Observed"))
         cards.addWidget(self.current_card, 2)
         cards.addWidget(self.today_card, 1)
         cards.addWidget(self.session_card, 1)
+        cards.addWidget(self.context_card, 1)
         layout.addLayout(cards)
 
         timeline_panel = QFrame()
@@ -151,6 +188,19 @@ class MainWindow(QMainWindow):
     def _monitoring_error(self, error: str) -> None:
         self.status.setText(f"Monitoring error: {error}")
 
+    def _run_context_inference(self) -> None:
+        """Start one background inference pass unless one is already running (overlap guard)."""
+        if self.context_coordinator is None:
+            return
+        if self.inference_worker is not None and self.inference_worker.isRunning():
+            return
+        self.inference_worker = ContextInferenceWorker(self.context_coordinator)
+        self.inference_worker.coordinator_error.connect(self._context_inference_error)
+        self.inference_worker.start()
+
+    def _context_inference_error(self, error: str) -> None:
+        self.status.setText(f"Context inference error: {error}")
+
     def refresh(self) -> None:
         running = self.worker is not None and self.worker.isRunning()
         snapshot = self.controller.snapshot(running)
@@ -161,6 +211,7 @@ class MainWindow(QMainWindow):
         self._set_card_values(self.current_values, (snapshot.current_application, snapshot.current_process, snapshot.current_title, snapshot.current_duration))
         self._set_card_values(self.today_values, (snapshot.total_today, str(snapshot.segment_count), str(snapshot.session_count)))
         self._set_card_values(self.session_values, (snapshot.session_label, snapshot.session_duration, str(snapshot.session_activity_count)))
+        self._set_card_values(self.context_values, (snapshot.latest_context_label, snapshot.latest_context_session, snapshot.latest_context_observed_at))
         self.timeline.setRowCount(len(snapshot.timeline))
         for row, item in enumerate(snapshot.timeline):
             for column, value in enumerate((item.timestamp, item.application, item.window_title, item.duration)):
@@ -178,6 +229,8 @@ class MainWindow(QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             self.worker.stop()
             self.worker.wait(2_000)
+        if self.inference_worker is not None and self.inference_worker.isRunning():
+            self.inference_worker.wait(2_000)
         event.accept()
 
 

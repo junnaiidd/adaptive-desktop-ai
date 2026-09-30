@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 from app.core.monitoring_service import ActivityMonitoringService
 from app.database.activity_repository import ActivityRepository, StoredActivity, StoredSession
+from app.ml.context_observation_store import ContextObservationStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,14 +38,23 @@ class DashboardSnapshot:
     session_duration: str
     session_activity_count: int
     timeline: tuple[TimelineItem, ...]
+    latest_context_label: str
+    latest_context_session: str
+    latest_context_observed_at: str
 
 
 class DashboardController:
     """Compose local data for the Activity screen without UI or SQL code."""
 
-    def __init__(self, repository: ActivityRepository, service: ActivityMonitoringService) -> None:
+    def __init__(
+        self,
+        repository: ActivityRepository,
+        service: ActivityMonitoringService,
+        context_observation_store: ContextObservationStore | None = None,
+    ) -> None:
         self.repository = repository
         self.service = service
+        self.context_observation_store = context_observation_store
 
     def snapshot(self, monitoring_running: bool) -> DashboardSnapshot:
         """Build a current dashboard snapshot from the local repository and service."""
@@ -55,6 +65,7 @@ class DashboardController:
         today_sessions = [item for item in sessions if item.started_at.date() == now.date()]
         current_activity = self.service.current_activity
         current_session = self.service.session_manager.current_session
+        latest_label, latest_session, latest_observed_at = self._latest_context()
 
         return DashboardSnapshot(
             monitoring_running=monitoring_running,
@@ -79,6 +90,29 @@ class DashboardController:
             timeline=tuple(
                 _timeline_item(item) for item in self.repository.list_recent_activities()
             ),
+            latest_context_label=latest_label,
+            latest_context_session=latest_session,
+            latest_context_observed_at=latest_observed_at,
+        )
+
+    def _latest_context(self) -> tuple[str, str, str]:
+        """
+        Read the single most recent context observation, if a store was
+        supplied and it has recorded at least one. Never raises: a
+        missing store or an empty store both produce the placeholder
+        state, exactly like every other "not available yet" field on
+        this snapshot.
+        """
+        if self.context_observation_store is None:
+            return "—", "—", "—"
+        recent = self.context_observation_store.list_recent_observations(limit=1)
+        if not recent:
+            return "—", "—", "—"
+        observation = recent[0]
+        return (
+            observation.predicted_label,
+            observation.session_id,
+            observation.observed_at.astimezone().strftime("%Y-%m-%d %H:%M"),
         )
 
 

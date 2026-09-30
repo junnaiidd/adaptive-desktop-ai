@@ -102,3 +102,79 @@ def test_dashboard_snapshot_refreshes_with_newest_persisted_activity_first(tmp_p
     snapshot = controller.snapshot(monitoring_running=True)
 
     assert [item.application for item in snapshot.timeline] == ["Latest", "Older"]
+
+
+# ============================================================================
+# Milestone A: latest-context fields (additive; existing tests above are
+# unmodified and still construct DashboardController with two arguments)
+# ============================================================================
+
+
+def _service_stub() -> SimpleNamespace:
+    return SimpleNamespace(
+        poll_interval_seconds=5.0,
+        current_activity=None,
+        current_duration_seconds=None,
+        session_manager=SimpleNamespace(current_session=None),
+    )
+
+
+def test_snapshot_shows_placeholder_when_no_observation_store_supplied(tmp_path) -> None:
+    repository = ActivityRepository(tmp_path / "activity.db")
+
+    snapshot = DashboardController(repository, _service_stub()).snapshot(monitoring_running=False)
+
+    assert snapshot.latest_context_label == "—"
+    assert snapshot.latest_context_session == "—"
+    assert snapshot.latest_context_observed_at == "—"
+
+
+def test_snapshot_shows_placeholder_when_store_supplied_but_empty(tmp_path) -> None:
+    from app.ml.context_observation_store import ContextObservationStore
+
+    repository = ActivityRepository(tmp_path / "activity.db")
+    store = ContextObservationStore(tmp_path / "activity.db")
+
+    snapshot = DashboardController(repository, _service_stub(), store).snapshot(monitoring_running=False)
+
+    assert snapshot.latest_context_label == "—"
+
+
+def test_snapshot_shows_the_most_recent_observation(tmp_path) -> None:
+    from app.ml.context_observation_store import ContextObservationStore
+
+    db_path = tmp_path / "activity.db"
+    repository = ActivityRepository(db_path)
+    started_at = _now() - timedelta(minutes=30)
+    repository.start_session(StoredSession("session-1", started_at, started_at + timedelta(minutes=10)))
+    store = ContextObservationStore(db_path)
+    store.record_observation(
+        "session-1", "Focused Work", {"Focused Work": 0.8, "Browsing": 0.2}, "v1",
+        observed_at=started_at + timedelta(minutes=10),
+    )
+
+    snapshot = DashboardController(repository, _service_stub(), store).snapshot(monitoring_running=False)
+
+    assert snapshot.latest_context_label == "Focused Work"
+    assert snapshot.latest_context_session == "session-1"
+    assert snapshot.latest_context_observed_at != "—"
+
+
+def test_snapshot_shows_the_newest_of_several_observations(tmp_path) -> None:
+    from app.ml.context_observation_store import ContextObservationStore
+
+    db_path = tmp_path / "activity.db"
+    repository = ActivityRepository(db_path)
+    started_at = _now() - timedelta(hours=1)
+    repository.start_session(StoredSession("session-1", started_at, started_at + timedelta(minutes=50)))
+    store = ContextObservationStore(db_path)
+    store.record_observation(
+        "session-1", "Older", {"Older": 1.0}, "v1", observed_at=started_at + timedelta(minutes=10)
+    )
+    store.record_observation(
+        "session-1", "Newer", {"Newer": 1.0}, "v1", observed_at=started_at + timedelta(minutes=40)
+    )
+
+    snapshot = DashboardController(repository, _service_stub(), store).snapshot(monitoring_running=False)
+
+    assert snapshot.latest_context_label == "Newer"
