@@ -39,6 +39,10 @@ class WorkThreadHasAssociationsError(WorkThreadError):
     """Raised when attempting to delete a work thread that still has associated observations."""
 
 
+class WorkThreadHasTasksError(WorkThreadError):
+    """Raised when attempting to delete a work thread that still has tasks."""
+
+
 class WorkThreadNotFoundError(WorkThreadError, KeyError):
     """Raised when a work thread cannot be found by ID."""
 
@@ -249,6 +253,19 @@ class WorkThreadStore:
                     raise WorkThreadHasAssociationsError(
                         f"Cannot delete work thread {work_thread_id}: it has {assoc_count} associated observation(s)."
                     )
+
+                table_exists = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'"
+                ).fetchone()
+                if table_exists:
+                    task_count = connection.execute(
+                        "SELECT COUNT(*) FROM tasks WHERE work_thread_id = ?",
+                        (work_thread_id,),
+                    ).fetchone()[0]
+                    if task_count > 0:
+                        raise WorkThreadHasTasksError(
+                            f"Cannot delete work thread {work_thread_id}: it has {task_count} task(s)."
+                        )
 
                 connection.execute("DELETE FROM work_threads WHERE id = ?", (work_thread_id,))
         finally:
