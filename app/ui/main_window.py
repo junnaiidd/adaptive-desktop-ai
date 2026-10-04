@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.ml.context_observation_store import ContextObservationStore
+from app.ml.task_store import TaskStore
 from app.ml.work_thread_store import WorkThreadStore
 from app.ui.context_inference_worker import ContextInferenceWorker
 from app.ui.context_observation_coordinator import ContextObservationCoordinator
@@ -40,11 +41,13 @@ class MainWindow(QMainWindow):
         controller: DashboardController,
         context_coordinator: ContextObservationCoordinator | None = None,
         work_thread_store: WorkThreadStore | None = None,
+        task_store: TaskStore | None = None,
     ) -> None:
         super().__init__()
         self.controller = controller
         self.context_coordinator = context_coordinator or self._build_default_coordinator(controller)
         self.work_thread_store = work_thread_store or self._build_default_work_thread_store(controller)
+        self.task_store = task_store or self._build_default_task_store(controller)
         self.worker: MonitoringWorker | None = None
         self.inference_worker: ContextInferenceWorker | None = None
         self.setWindowTitle("Adaptive Desktop AI")
@@ -90,6 +93,19 @@ class MainWindow(QMainWindow):
         if store is None:
             store = WorkThreadStore(controller.repository.database_path)
             controller.work_thread_store = store
+        return store
+
+    @staticmethod
+    def _build_default_task_store(controller: DashboardController) -> TaskStore:
+        """
+        Self-wire the TaskStore when the caller does not supply one explicitly.
+        Reuses the SAME database file `controller.repository` already points at,
+        and shares that store with `controller`.
+        """
+        store = controller.task_store
+        if store is None:
+            store = TaskStore(controller.repository.database_path)
+            controller.task_store = store
         return store
 
     def _build_ui(self) -> None:
@@ -184,6 +200,7 @@ class MainWindow(QMainWindow):
 
         self.thread_dropdown = QComboBox()
         self.thread_dropdown.setMinimumWidth(200)
+        self.thread_dropdown.currentIndexChanged.connect(self._on_thread_dropdown_changed)
         controls_row.addWidget(self.thread_dropdown, 2)
 
         self.associate_btn = QPushButton("Associate latest context")
@@ -208,6 +225,96 @@ class MainWindow(QMainWindow):
         self.threads_table.setMaximumHeight(110)
         self.threads_table.itemSelectionChanged.connect(self._on_thread_table_selection_changed)
         threads_layout.addWidget(self.threads_table)
+
+        # Tasks Section for selected Work Thread
+        tasks_title = QLabel("Tasks")
+        tasks_title.setObjectName("panelTitle")
+        threads_layout.addWidget(tasks_title)
+
+        task_controls_row = QHBoxLayout()
+        task_controls_row.setSpacing(10)
+
+        self.task_input = QLineEdit()
+        self.task_input.setPlaceholderText("Add a task to selected thread...")
+        self.task_input.returnPressed.connect(self._create_task)
+        task_controls_row.addWidget(self.task_input, 2)
+
+        self.add_task_btn = QPushButton("Add task")
+        self.add_task_btn.clicked.connect(self._create_task)
+        task_controls_row.addWidget(self.add_task_btn)
+
+        self.toggle_task_btn = QPushButton("Toggle done")
+        self.toggle_task_btn.clicked.connect(self._toggle_selected_task)
+        self.toggle_task_btn.setEnabled(False)
+        task_controls_row.addWidget(self.toggle_task_btn)
+
+        self.delete_task_btn = QPushButton("Delete task")
+        self.delete_task_btn.clicked.connect(self._delete_selected_task)
+        self.delete_task_btn.setEnabled(False)
+        task_controls_row.addWidget(self.delete_task_btn)
+
+        threads_layout.addLayout(task_controls_row)
+
+        self.task_feedback = QLabel()
+        self.task_feedback.setObjectName("caption")
+        threads_layout.addWidget(self.task_feedback)
+
+        self.tasks_table = QTableWidget(0, 3)
+        self.tasks_table.setHorizontalHeaderLabels(("Status", "Task title", "Created"))
+        self.tasks_table.verticalHeader().setVisible(False)
+        self.tasks_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tasks_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tasks_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tasks_table.horizontalHeader().setStretchLastSection(True)
+        self.tasks_table.setColumnWidth(0, 80)
+        self.tasks_table.setColumnWidth(1, 340)
+        self.tasks_table.setMaximumHeight(110)
+        self.tasks_table.itemSelectionChanged.connect(self._on_task_selection_changed)
+        self.tasks_table.cellDoubleClicked.connect(lambda row, col: self._toggle_selected_task())
+        threads_layout.addWidget(self.tasks_table)
+
+        # ------------------------------------------------------------------
+        # Unfinished Work panel  (open tasks across all Work Threads)
+        # ------------------------------------------------------------------
+        unfinished_title = QLabel("Unfinished work")
+        unfinished_title.setObjectName("panelTitle")
+        threads_layout.addWidget(unfinished_title)
+
+        unfinished_controls_row = QHBoxLayout()
+        unfinished_controls_row.setSpacing(10)
+
+        self.mark_done_btn = QPushButton("Mark done")
+        self.mark_done_btn.setObjectName("markDoneBtn")
+        self.mark_done_btn.clicked.connect(self._mark_open_task_done)
+        self.mark_done_btn.setEnabled(False)
+        unfinished_controls_row.addWidget(self.mark_done_btn)
+
+        self.goto_thread_btn = QPushButton("Go to thread")
+        self.goto_thread_btn.setObjectName("gotoThreadBtn")
+        self.goto_thread_btn.clicked.connect(self._goto_thread_of_open_task)
+        self.goto_thread_btn.setEnabled(False)
+        unfinished_controls_row.addWidget(self.goto_thread_btn)
+
+        unfinished_controls_row.addStretch()
+        threads_layout.addLayout(unfinished_controls_row)
+
+        self.unfinished_feedback = QLabel()
+        self.unfinished_feedback.setObjectName("caption")
+        threads_layout.addWidget(self.unfinished_feedback)
+
+        self.unfinished_table = QTableWidget(0, 3)
+        self.unfinished_table.setHorizontalHeaderLabels(("Work thread", "Open task", "Created"))
+        self.unfinished_table.verticalHeader().setVisible(False)
+        self.unfinished_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.unfinished_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.unfinished_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.unfinished_table.horizontalHeader().setStretchLastSection(True)
+        self.unfinished_table.setColumnWidth(0, 180)
+        self.unfinished_table.setColumnWidth(1, 300)
+        self.unfinished_table.setMaximumHeight(140)
+        self.unfinished_table.itemSelectionChanged.connect(self._on_unfinished_selection_changed)
+        self.unfinished_table.cellDoubleClicked.connect(lambda row, col: self._mark_open_task_done())
+        threads_layout.addWidget(self.unfinished_table)
 
         layout.addWidget(threads_panel)
 
@@ -300,6 +407,175 @@ class MainWindow(QMainWindow):
             except ValueError:
                 pass
 
+    def _on_thread_dropdown_changed(self) -> None:
+        self._refresh_tasks()
+
+    def _refresh_tasks(self) -> None:
+        selected_thread_id = self.thread_dropdown.currentData()
+        if selected_thread_id is None:
+            self.task_input.setEnabled(False)
+            self.add_task_btn.setEnabled(False)
+            self.toggle_task_btn.setEnabled(False)
+            self.delete_task_btn.setEnabled(False)
+            self.tasks_table.setRowCount(0)
+            return
+
+        self.task_input.setEnabled(True)
+        self.add_task_btn.setEnabled(True)
+        tasks = self.task_store.list_tasks_for_work_thread(selected_thread_id)
+        self.tasks_table.setRowCount(len(tasks))
+        for row, task in enumerate(tasks):
+            status_text = "✓ Done" if task.is_done else "○ Todo"
+            status_item = QTableWidgetItem(status_text)
+            status_item.setData(Qt.ItemDataRole.UserRole, task.id)
+
+            title_item = QTableWidgetItem(task.title)
+            title_item.setData(Qt.ItemDataRole.UserRole, task.id)
+            title_item.setToolTip(task.title)
+
+            time_text = task.created_at.astimezone().strftime("%Y-%m-%d %H:%M")
+            time_item = QTableWidgetItem(time_text)
+            time_item.setData(Qt.ItemDataRole.UserRole, task.id)
+
+            self.tasks_table.setItem(row, 0, status_item)
+            self.tasks_table.setItem(row, 1, title_item)
+            self.tasks_table.setItem(row, 2, time_item)
+
+        self._on_task_selection_changed()
+
+    def _on_task_selection_changed(self) -> None:
+        has_selection = len(self.tasks_table.selectedItems()) > 0
+        self.toggle_task_btn.setEnabled(has_selection)
+        self.delete_task_btn.setEnabled(has_selection)
+
+    def _get_selected_task_id(self) -> int | None:
+        selected_items = self.tasks_table.selectedItems()
+        if not selected_items:
+            return None
+        return selected_items[0].data(Qt.ItemDataRole.UserRole)
+
+    def _create_task(self) -> None:
+        selected_thread_id = self.thread_dropdown.currentData()
+        if selected_thread_id is None:
+            self.task_feedback.setText("Please select a work thread first.")
+            return
+
+        title = self.task_input.text().strip()
+        if not title:
+            self.task_feedback.setText("Please enter a non-empty task title.")
+            return
+
+        try:
+            created = self.task_store.create_task(
+                selected_thread_id,
+                title,
+                created_at=datetime.now(timezone.utc),
+            )
+            self.task_input.clear()
+            self.task_feedback.setText(f"Added task: '{created.title}'")
+            self._refresh_tasks()
+        except Exception as e:
+            self.task_feedback.setText(f"Error creating task: {e}")
+
+    def _toggle_selected_task(self) -> None:
+        task_id = self._get_selected_task_id()
+        if task_id is None:
+            return
+        try:
+            updated = self.task_store.toggle_task(task_id)
+            status_label = "completed" if updated.is_done else "marked pending"
+            self.task_feedback.setText(f"Task '{updated.title}' {status_label}.")
+            self._refresh_tasks()
+        except Exception as e:
+            self.task_feedback.setText(f"Error toggling task: {e}")
+
+    def _delete_selected_task(self) -> None:
+        task_id = self._get_selected_task_id()
+        if task_id is None:
+            return
+        try:
+            self.task_store.delete_task(task_id)
+            self.task_feedback.setText("Task deleted.")
+            self._refresh_tasks()
+        except Exception as e:
+            self.task_feedback.setText(f"Error deleting task: {e}")
+
+    # ------------------------------------------------------------------
+    # Unfinished Work handlers
+    # ------------------------------------------------------------------
+
+    def _refresh_unfinished(self, open_tasks: tuple) -> None:
+        """Populate the Unfinished Work table from the snapshot's open_tasks."""
+        self.unfinished_table.setRowCount(0)
+        row_idx = 0
+        for thread, tasks in open_tasks:
+            for task in tasks:
+                self.unfinished_table.insertRow(row_idx)
+
+                thread_item = QTableWidgetItem(thread.name)
+                thread_item.setData(Qt.ItemDataRole.UserRole, (task.id, thread.id))
+                thread_item.setToolTip(thread.name)
+
+                task_item = QTableWidgetItem(task.title)
+                task_item.setData(Qt.ItemDataRole.UserRole, (task.id, thread.id))
+                task_item.setToolTip(task.title)
+
+                time_text = task.created_at.astimezone().strftime("%Y-%m-%d %H:%M")
+                time_item = QTableWidgetItem(time_text)
+                time_item.setData(Qt.ItemDataRole.UserRole, (task.id, thread.id))
+
+                self.unfinished_table.setItem(row_idx, 0, thread_item)
+                self.unfinished_table.setItem(row_idx, 1, task_item)
+                self.unfinished_table.setItem(row_idx, 2, time_item)
+                row_idx += 1
+
+        self._on_unfinished_selection_changed()
+        total = row_idx
+        if total == 0:
+            self.unfinished_feedback.setText("No unfinished tasks.")
+        else:
+            self.unfinished_feedback.setText(f"{total} open task{'s' if total != 1 else ''} across your work threads.")
+
+    def _on_unfinished_selection_changed(self) -> None:
+        has = len(self.unfinished_table.selectedItems()) > 0
+        self.mark_done_btn.setEnabled(has)
+        self.goto_thread_btn.setEnabled(has)
+
+    def _get_selected_open_task_ids(self) -> tuple[int, int] | None:
+        """Return (task_id, thread_id) for the selected unfinished row, or None."""
+        items = self.unfinished_table.selectedItems()
+        if not items:
+            return None
+        return items[0].data(Qt.ItemDataRole.UserRole)  # (task_id, thread_id)
+
+    def _mark_open_task_done(self) -> None:
+        ids = self._get_selected_open_task_ids()
+        if ids is None:
+            return
+        task_id, _thread_id = ids
+        try:
+            updated = self.task_store.set_task_done(task_id, is_done=True)
+            self.unfinished_feedback.setText(f"Marked '{updated.title}' as done.")
+            self.refresh()
+        except Exception as e:
+            self.unfinished_feedback.setText(f"Error marking task done: {e}")
+
+    def _goto_thread_of_open_task(self) -> None:
+        ids = self._get_selected_open_task_ids()
+        if ids is None:
+            return
+        _task_id, thread_id = ids
+        index = self.thread_dropdown.findData(thread_id)
+        if index >= 0:
+            self.thread_dropdown.setCurrentIndex(index)
+            # Also highlight the matching row in the threads table
+            for row in range(self.threads_table.rowCount()):
+                id_item = self.threads_table.item(row, 0)
+                if id_item and id_item.text() == str(thread_id):
+                    self.threads_table.selectRow(row)
+                    break
+        self.unfinished_feedback.setText(f"Switched to thread #{thread_id}.")
+
     def toggle_monitoring(self) -> None:
         if self.worker is not None and self.worker.isRunning():
             self.worker.stop()
@@ -378,6 +654,8 @@ class MainWindow(QMainWindow):
 
         self.thread_dropdown.blockSignals(False)
         self.associate_btn.setEnabled(len(threads) > 0 and snapshot.latest_context_observation_id is not None)
+        self._refresh_tasks()
+        self._refresh_unfinished(snapshot.open_tasks)
 
         self.footer.setText(f"{snapshot.polling_interval}  ·  Database {snapshot.database_status}")
 

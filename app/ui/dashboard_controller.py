@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from app.core.monitoring_service import ActivityMonitoringService
 from app.database.activity_repository import ActivityRepository, StoredActivity, StoredSession
 from app.ml.context_observation_store import ContextObservation, ContextObservationStore
+from app.ml.task_store import Task, TaskStore
 from app.ml.work_thread_store import WorkThread, WorkThreadObservation, WorkThreadStore
 
 
@@ -44,6 +45,9 @@ class DashboardSnapshot:
     latest_context_observed_at: str
     latest_context_observation_id: int | None = None
     work_threads: tuple[WorkThread, ...] = ()
+    # Each element is (thread, open_tasks_for_thread). Only threads that have
+    # at least one incomplete task are included, ordered by thread creation.
+    open_tasks: tuple[tuple[WorkThread, tuple[Task, ...]], ...] = ()
 
 
 class DashboardController:
@@ -55,11 +59,13 @@ class DashboardController:
         service: ActivityMonitoringService,
         context_observation_store: ContextObservationStore | None = None,
         work_thread_store: WorkThreadStore | None = None,
+        task_store: TaskStore | None = None,
     ) -> None:
         self.repository = repository
         self.service = service
         self.context_observation_store = context_observation_store
         self.work_thread_store = work_thread_store
+        self.task_store = task_store
 
     def snapshot(self, monitoring_running: bool) -> DashboardSnapshot:
         """Build a current dashboard snapshot from the local repository and service."""
@@ -72,6 +78,7 @@ class DashboardController:
         current_session = self.service.session_manager.current_session
         latest_label, latest_session, latest_observed_at, latest_obs_id = self._latest_context_details()
         threads = self._work_threads()
+        open_tasks = self._open_tasks_by_thread(threads)
 
         return DashboardSnapshot(
             monitoring_running=monitoring_running,
@@ -101,6 +108,7 @@ class DashboardController:
             latest_context_observed_at=latest_observed_at,
             latest_context_observation_id=latest_obs_id,
             work_threads=threads,
+            open_tasks=open_tasks,
         )
 
     def create_work_thread(self, name: str) -> WorkThread | None:
@@ -126,6 +134,61 @@ class DashboardController:
             latest_obs.id,
             associated_at=datetime.now(timezone.utc),
         )
+
+    def list_tasks_for_work_thread(self, work_thread_id: int) -> tuple[Task, ...]:
+        """List tasks for a specific work thread, or empty tuple if no task store."""
+        if self.task_store is None:
+            return ()
+        return tuple(self.task_store.list_tasks_for_work_thread(work_thread_id))
+
+    def create_task(self, work_thread_id: int, title: str) -> Task | None:
+        """Create a task in a specific work thread, or None if no task store."""
+        if self.task_store is None:
+            return None
+        return self.task_store.create_task(
+            work_thread_id, title, created_at=datetime.now(timezone.utc)
+        )
+
+    def toggle_task(self, task_id: int) -> Task | None:
+        """Toggle task completion, or None if no task store."""
+        if self.task_store is None:
+            return None
+        return self.task_store.toggle_task(task_id)
+
+    def delete_task(self, task_id: int) -> None:
+        """Delete a task if task store is configured."""
+        if self.task_store is not None:
+            self.task_store.delete_task(task_id)
+
+    def list_open_tasks(self) -> tuple[tuple[WorkThread, tuple[Task, ...]], ...]:
+        """
+        Return all incomplete tasks across every Work Thread, grouped by thread.
+
+        Each element is ``(thread, open_tasks_for_thread)`` where
+        ``open_tasks_for_thread`` contains only tasks whose ``is_done`` is
+        ``False``.  Threads with no open tasks are omitted.  Order follows
+        thread creation (oldest first).
+
+        Returns an empty tuple when either store is absent.
+        """
+        return self._open_tasks_by_thread(self._work_threads())
+
+    def _open_tasks_by_thread(
+        self, threads: tuple[WorkThread, ...]
+    ) -> tuple[tuple[WorkThread, tuple[Task, ...]], ...]:
+        """Internal helper shared by ``snapshot`` and ``list_open_tasks``."""
+        if self.task_store is None or not threads:
+            return ()
+        result: list[tuple[WorkThread, tuple[Task, ...]]] = []
+        for thread in threads:
+            open_tasks = tuple(
+                t
+                for t in self.task_store.list_tasks_for_work_thread(thread.id)
+                if not t.is_done
+            )
+            if open_tasks:
+                result.append((thread, open_tasks))
+        return tuple(result)
 
     def _latest_observation(self) -> ContextObservation | None:
         if self.context_observation_store is None:

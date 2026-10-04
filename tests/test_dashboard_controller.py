@@ -338,3 +338,222 @@ def test_main_window_reuses_existing_work_thread_store_on_controller(tmp_path) -
 
     store = MainWindow._build_default_work_thread_store(controller)
     assert store is existing_store
+
+
+# ============================================================================
+# Task integration tests
+# ============================================================================
+
+
+def test_controller_task_helpers_return_empty_or_none_without_task_store(tmp_path) -> None:
+    repository = ActivityRepository(tmp_path / "activity.db")
+    controller = DashboardController(repository, _service_stub())
+
+    assert controller.list_tasks_for_work_thread(1) == ()
+    assert controller.create_task(1, "Test") is None
+    assert controller.toggle_task(1) is None
+    controller.delete_task(1)  # must not raise
+
+
+def test_controller_create_list_toggle_delete_tasks(tmp_path) -> None:
+    from app.ml.task_store import TaskStore
+    from app.ml.work_thread_store import WorkThreadStore
+
+    db_path = tmp_path / "activity.db"
+    repository = ActivityRepository(db_path)
+    wt_store = WorkThreadStore(db_path)
+    task_store = TaskStore(db_path)
+    controller = DashboardController(
+        repository,
+        _service_stub(),
+        work_thread_store=wt_store,
+        task_store=task_store,
+    )
+
+    thread = wt_store.create_work_thread("Thread for tasks", created_at=_now())
+
+    task = controller.create_task(thread.id, "Buy coffee")
+    assert task is not None
+    assert task.title == "Buy coffee"
+    assert task.is_done is False
+
+    tasks = controller.list_tasks_for_work_thread(thread.id)
+    assert len(tasks) == 1
+    assert tasks[0].id == task.id
+
+    toggled = controller.toggle_task(task.id)
+    assert toggled is not None
+    assert toggled.is_done is True
+
+    controller.delete_task(task.id)
+    assert controller.list_tasks_for_work_thread(thread.id) == ()
+
+
+def test_main_window_self_wires_task_store_when_none_supplied(tmp_path) -> None:
+    from app.ml.task_store import TaskStore
+    from app.ui.main_window import MainWindow
+
+    db_path = tmp_path / "activity.db"
+    repository = ActivityRepository(db_path)
+    controller = DashboardController(repository, _service_stub())
+
+    assert controller.task_store is None
+    store = MainWindow._build_default_task_store(controller)
+
+    assert isinstance(store, TaskStore)
+    assert store.database_path == db_path
+    assert controller.task_store is store
+
+
+def test_main_window_reuses_existing_task_store_on_controller(tmp_path) -> None:
+    from app.ml.task_store import TaskStore
+    from app.ui.main_window import MainWindow
+
+    db_path = tmp_path / "activity.db"
+    repository = ActivityRepository(db_path)
+    existing_store = TaskStore(db_path)
+    controller = DashboardController(repository, _service_stub(), task_store=existing_store)
+
+    store = MainWindow._build_default_task_store(controller)
+    assert store is existing_store
+
+
+# ============================================================================
+# Unfinished Work: list_open_tasks() and snapshot.open_tasks
+# ============================================================================
+
+
+def _full_controller(tmp_path) -> tuple:
+    """Return (controller, wt_store, task_store) all sharing one DB."""
+    from app.ml.task_store import TaskStore
+    from app.ml.work_thread_store import WorkThreadStore
+
+    db_path = tmp_path / "activity.db"
+    repository = ActivityRepository(db_path)
+    wt_store = WorkThreadStore(db_path)
+    task_store = TaskStore(db_path)
+    controller = DashboardController(
+        repository,
+        _service_stub(),
+        work_thread_store=wt_store,
+        task_store=task_store,
+    )
+    return controller, wt_store, task_store
+
+
+def test_list_open_tasks_returns_empty_without_stores(tmp_path) -> None:
+    repository = ActivityRepository(tmp_path / "activity.db")
+    controller = DashboardController(repository, _service_stub())
+
+    assert controller.list_open_tasks() == ()
+
+
+def test_list_open_tasks_returns_empty_when_no_threads(tmp_path) -> None:
+    controller, _wts, _ts = _full_controller(tmp_path)
+
+    assert controller.list_open_tasks() == ()
+
+
+def test_list_open_tasks_returns_empty_when_all_tasks_done(tmp_path) -> None:
+    controller, wt_store, task_store = _full_controller(tmp_path)
+    thread = wt_store.create_work_thread("Done thread", created_at=_now())
+    task = task_store.create_task(thread.id, "Already done", created_at=_now())
+    task_store.complete_task(task.id)
+
+    assert controller.list_open_tasks() == ()
+
+
+def test_list_open_tasks_returns_only_incomplete_tasks(tmp_path) -> None:
+    controller, wt_store, task_store = _full_controller(tmp_path)
+    thread = wt_store.create_work_thread("Mixed thread", created_at=_now())
+    open_task = task_store.create_task(thread.id, "Still open", created_at=_now())
+    done_task = task_store.create_task(thread.id, "Finished", created_at=_now())
+    task_store.complete_task(done_task.id)
+
+    result = controller.list_open_tasks()
+
+    assert len(result) == 1
+    returned_thread, open_tasks = result[0]
+    assert returned_thread.id == thread.id
+    assert len(open_tasks) == 1
+    assert open_tasks[0].id == open_task.id
+    assert open_tasks[0].is_done is False
+
+
+def test_list_open_tasks_omits_threads_with_no_open_tasks(tmp_path) -> None:
+    controller, wt_store, task_store = _full_controller(tmp_path)
+    done_thread = wt_store.create_work_thread("Done thread", created_at=_now() - timedelta(minutes=5))
+    open_thread = wt_store.create_work_thread("Open thread", created_at=_now())
+
+    t1 = task_store.create_task(done_thread.id, "Finished task", created_at=_now())
+    task_store.complete_task(t1.id)
+    task_store.create_task(open_thread.id, "Pending task", created_at=_now())
+
+    result = controller.list_open_tasks()
+
+    assert len(result) == 1
+    assert result[0][0].id == open_thread.id
+
+
+def test_list_open_tasks_groups_by_thread_in_creation_order(tmp_path) -> None:
+    controller, wt_store, task_store = _full_controller(tmp_path)
+    t1 = wt_store.create_work_thread("Alpha", created_at=_now() - timedelta(minutes=10))
+    t2 = wt_store.create_work_thread("Beta", created_at=_now())
+    task_store.create_task(t1.id, "Alpha task 1", created_at=_now())
+    task_store.create_task(t1.id, "Alpha task 2", created_at=_now())
+    task_store.create_task(t2.id, "Beta task", created_at=_now())
+
+    result = controller.list_open_tasks()
+
+    assert len(result) == 2
+    assert result[0][0].id == t1.id
+    assert len(result[0][1]) == 2
+    assert result[1][0].id == t2.id
+    assert len(result[1][1]) == 1
+
+
+def test_snapshot_open_tasks_matches_list_open_tasks(tmp_path) -> None:
+    controller, wt_store, task_store = _full_controller(tmp_path)
+    thread = wt_store.create_work_thread("Snapshot thread", created_at=_now())
+    task_store.create_task(thread.id, "Snapshot task", created_at=_now())
+
+    snapshot = controller.snapshot(monitoring_running=False)
+    direct = controller.list_open_tasks()
+
+    assert len(snapshot.open_tasks) == len(direct)
+    assert snapshot.open_tasks[0][0].id == direct[0][0].id
+    assert snapshot.open_tasks[0][1][0].id == direct[0][1][0].id
+
+
+def test_marking_task_done_removes_it_from_open_tasks(tmp_path) -> None:
+    controller, wt_store, task_store = _full_controller(tmp_path)
+    thread = wt_store.create_work_thread("Thread", created_at=_now())
+    task = task_store.create_task(thread.id, "Will be done", created_at=_now())
+
+    assert len(controller.list_open_tasks()) == 1
+
+    task_store.complete_task(task.id)
+
+    assert controller.list_open_tasks() == ()
+
+
+def test_open_tasks_isolated_across_threads(tmp_path) -> None:
+    """Open tasks from one thread must not bleed into another thread's group."""
+    controller, wt_store, task_store = _full_controller(tmp_path)
+    t1 = wt_store.create_work_thread("Thread A", created_at=_now() - timedelta(minutes=5))
+    t2 = wt_store.create_work_thread("Thread B", created_at=_now())
+    ta = task_store.create_task(t1.id, "A task", created_at=_now())
+    task_store.create_task(t2.id, "B task", created_at=_now())
+
+    result = controller.list_open_tasks()
+    # Both threads have open tasks
+    assert len(result) == 2
+    id_map = {thread.id: tasks for thread, tasks in result}
+    assert all(t.work_thread_id == t1.id for t in id_map[t1.id])
+    assert all(t.work_thread_id == t2.id for t in id_map[t2.id])
+
+    # Complete t1's task — t1 should disappear from unfinished
+    task_store.complete_task(ta.id)
+    result2 = controller.list_open_tasks()
+    assert len(result2) == 1
+    assert result2[0][0].id == t2.id
