@@ -178,3 +178,163 @@ def test_snapshot_shows_the_newest_of_several_observations(tmp_path) -> None:
     snapshot = DashboardController(repository, _service_stub(), store).snapshot(monitoring_running=False)
 
     assert snapshot.latest_context_label == "Newer"
+
+
+# ============================================================================
+# Milestone B: Work Thread fields and actions
+# ============================================================================
+
+
+def test_snapshot_work_threads_empty_when_no_work_thread_store_supplied(tmp_path) -> None:
+    repository = ActivityRepository(tmp_path / "activity.db")
+    snapshot = DashboardController(repository, _service_stub()).snapshot(monitoring_running=False)
+
+    assert snapshot.work_threads == ()
+    assert snapshot.latest_context_observation_id is None
+
+
+def test_snapshot_work_threads_empty_when_store_empty(tmp_path) -> None:
+    from app.ml.work_thread_store import WorkThreadStore
+
+    db_path = tmp_path / "activity.db"
+    repository = ActivityRepository(db_path)
+    wt_store = WorkThreadStore(db_path)
+
+    snapshot = DashboardController(repository, _service_stub(), work_thread_store=wt_store).snapshot(
+        monitoring_running=False
+    )
+
+    assert snapshot.work_threads == ()
+
+
+def test_snapshot_exposes_persisted_work_threads_in_order(tmp_path) -> None:
+    from app.ml.work_thread_store import WorkThreadStore
+
+    db_path = tmp_path / "activity.db"
+    repository = ActivityRepository(db_path)
+    wt_store = WorkThreadStore(db_path)
+
+    now = _now()
+    t1 = wt_store.create_work_thread("First Thread", created_at=now - timedelta(minutes=5))
+    t2 = wt_store.create_work_thread("Second Thread", created_at=now)
+
+    snapshot = DashboardController(repository, _service_stub(), work_thread_store=wt_store).snapshot(
+        monitoring_running=False
+    )
+
+    assert len(snapshot.work_threads) == 2
+    assert snapshot.work_threads[0].id == t1.id
+    assert snapshot.work_threads[0].name == "First Thread"
+    assert snapshot.work_threads[1].id == t2.id
+    assert snapshot.work_threads[1].name == "Second Thread"
+
+
+def test_snapshot_exposes_latest_context_observation_id(tmp_path) -> None:
+    from app.ml.context_observation_store import ContextObservationStore
+
+    db_path = tmp_path / "activity.db"
+    repository = ActivityRepository(db_path)
+    started_at = _now() - timedelta(minutes=30)
+    repository.start_session(StoredSession("session-1", started_at, started_at + timedelta(minutes=10)))
+    obs_store = ContextObservationStore(db_path)
+    obs = obs_store.record_observation(
+        "session-1", "Coding", {"Coding": 1.0}, "v1", observed_at=started_at + timedelta(minutes=10)
+    )
+
+    snapshot = DashboardController(repository, _service_stub(), obs_store).snapshot(monitoring_running=False)
+
+    assert snapshot.latest_context_observation_id == obs.id
+
+
+def test_controller_create_work_thread_and_associate_latest_context(tmp_path) -> None:
+    from app.ml.context_observation_store import ContextObservationStore
+    from app.ml.work_thread_store import WorkThreadStore
+
+    db_path = tmp_path / "activity.db"
+    repository = ActivityRepository(db_path)
+    started_at = _now() - timedelta(minutes=30)
+    repository.start_session(StoredSession("session-1", started_at, started_at + timedelta(minutes=10)))
+    obs_store = ContextObservationStore(db_path)
+    obs = obs_store.record_observation(
+        "session-1", "Deep Work", {"Deep Work": 1.0}, "v1", observed_at=started_at + timedelta(minutes=10)
+    )
+    wt_store = WorkThreadStore(db_path)
+    controller = DashboardController(
+        repository,
+        _service_stub(),
+        context_observation_store=obs_store,
+        work_thread_store=wt_store,
+    )
+
+    # Create thread through controller
+    thread = controller.create_work_thread("Controller Created Thread")
+    assert thread is not None
+    assert thread.name == "Controller Created Thread"
+
+    # Associate latest context
+    assoc = controller.associate_latest_context(thread.id)
+    assert assoc is not None
+    assert assoc.work_thread_id == thread.id
+    assert assoc.observation_id == obs.id
+
+    # Verify through store
+    assocs = wt_store.list_observations_for_work_thread(thread.id)
+    assert len(assocs) == 1
+    assert assocs[0].id == assoc.id
+
+
+def test_controller_associate_latest_context_when_no_observation_available(tmp_path) -> None:
+    from app.ml.context_observation_store import ContextObservationStore
+    from app.ml.work_thread_store import WorkThreadStore
+
+    db_path = tmp_path / "activity.db"
+    repository = ActivityRepository(db_path)
+    obs_store = ContextObservationStore(db_path)
+    wt_store = WorkThreadStore(db_path)
+    controller = DashboardController(
+        repository,
+        _service_stub(),
+        context_observation_store=obs_store,
+        work_thread_store=wt_store,
+    )
+    thread = wt_store.create_work_thread("Thread", created_at=_now())
+
+    assoc = controller.associate_latest_context(thread.id)
+    assert assoc is None
+
+
+def test_controller_helpers_return_none_without_stores(tmp_path) -> None:
+    repository = ActivityRepository(tmp_path / "activity.db")
+    controller = DashboardController(repository, _service_stub())
+
+    assert controller.create_work_thread("Test") is None
+    assert controller.associate_latest_context(1) is None
+
+
+def test_main_window_self_wires_work_thread_store_when_none_supplied(tmp_path) -> None:
+    from app.ml.work_thread_store import WorkThreadStore
+    from app.ui.main_window import MainWindow
+
+    db_path = tmp_path / "activity.db"
+    repository = ActivityRepository(db_path)
+    controller = DashboardController(repository, _service_stub())
+
+    assert controller.work_thread_store is None
+    store = MainWindow._build_default_work_thread_store(controller)
+
+    assert isinstance(store, WorkThreadStore)
+    assert store.database_path == db_path
+    assert controller.work_thread_store is store
+
+
+def test_main_window_reuses_existing_work_thread_store_on_controller(tmp_path) -> None:
+    from app.ml.work_thread_store import WorkThreadStore
+    from app.ui.main_window import MainWindow
+
+    db_path = tmp_path / "activity.db"
+    repository = ActivityRepository(db_path)
+    existing_store = WorkThreadStore(db_path)
+    controller = DashboardController(repository, _service_stub(), work_thread_store=existing_store)
+
+    store = MainWindow._build_default_work_thread_store(controller)
+    assert store is existing_store

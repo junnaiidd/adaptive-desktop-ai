@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 
 from app.core.monitoring_service import ActivityMonitoringService
 from app.database.activity_repository import ActivityRepository, StoredActivity, StoredSession
-from app.ml.context_observation_store import ContextObservationStore
+from app.ml.context_observation_store import ContextObservation, ContextObservationStore
+from app.ml.work_thread_store import WorkThread, WorkThreadObservation, WorkThreadStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +42,8 @@ class DashboardSnapshot:
     latest_context_label: str
     latest_context_session: str
     latest_context_observed_at: str
+    latest_context_observation_id: int | None = None
+    work_threads: tuple[WorkThread, ...] = ()
 
 
 class DashboardController:
@@ -51,10 +54,12 @@ class DashboardController:
         repository: ActivityRepository,
         service: ActivityMonitoringService,
         context_observation_store: ContextObservationStore | None = None,
+        work_thread_store: WorkThreadStore | None = None,
     ) -> None:
         self.repository = repository
         self.service = service
         self.context_observation_store = context_observation_store
+        self.work_thread_store = work_thread_store
 
     def snapshot(self, monitoring_running: bool) -> DashboardSnapshot:
         """Build a current dashboard snapshot from the local repository and service."""
@@ -65,7 +70,8 @@ class DashboardController:
         today_sessions = [item for item in sessions if item.started_at.date() == now.date()]
         current_activity = self.service.current_activity
         current_session = self.service.session_manager.current_session
-        latest_label, latest_session, latest_observed_at = self._latest_context()
+        latest_label, latest_session, latest_observed_at, latest_obs_id = self._latest_context_details()
+        threads = self._work_threads()
 
         return DashboardSnapshot(
             monitoring_running=monitoring_running,
@@ -93,27 +99,61 @@ class DashboardController:
             latest_context_label=latest_label,
             latest_context_session=latest_session,
             latest_context_observed_at=latest_observed_at,
+            latest_context_observation_id=latest_obs_id,
+            work_threads=threads,
         )
 
-    def _latest_context(self) -> tuple[str, str, str]:
+    def create_work_thread(self, name: str) -> WorkThread | None:
+        """Create a new work thread using current UTC time, or None if store not configured."""
+        if self.work_thread_store is None:
+            return None
+        return self.work_thread_store.create_work_thread(
+            name, created_at=datetime.now(timezone.utc)
+        )
+
+    def associate_latest_context(self, work_thread_id: int) -> WorkThreadObservation | None:
         """
-        Read the single most recent context observation, if a store was
-        supplied and it has recorded at least one. Never raises: a
-        missing store or an empty store both produce the placeholder
-        state, exactly like every other "not available yet" field on
-        this snapshot.
+        Associate the latest displayed context observation with a selected work thread,
+        or None if no store or no observation is available.
         """
+        if self.work_thread_store is None:
+            return None
+        latest_obs = self._latest_observation()
+        if latest_obs is None:
+            return None
+        return self.work_thread_store.associate_observation(
+            work_thread_id,
+            latest_obs.id,
+            associated_at=datetime.now(timezone.utc),
+        )
+
+    def _latest_observation(self) -> ContextObservation | None:
         if self.context_observation_store is None:
-            return "—", "—", "—"
+            return None
         recent = self.context_observation_store.list_recent_observations(limit=1)
-        if not recent:
-            return "—", "—", "—"
-        observation = recent[0]
+        return recent[0] if recent else None
+
+    def _latest_context(self) -> tuple[str, str, str]:
+        """Backward-compatible tuple (label, session, observed_at)."""
+        label, session, observed_at, _ = self._latest_context_details()
+        return label, session, observed_at
+
+    def _latest_context_details(self) -> tuple[str, str, str, int | None]:
+        """Read the single most recent context observation details."""
+        observation = self._latest_observation()
+        if observation is None:
+            return "—", "—", "—", None
         return (
             observation.predicted_label,
             observation.session_id,
             observation.observed_at.astimezone().strftime("%Y-%m-%d %H:%M"),
+            observation.id,
         )
+
+    def _work_threads(self) -> tuple[WorkThread, ...]:
+        if self.work_thread_store is None:
+            return ()
+        return tuple(self.work_thread_store.list_work_threads())
 
 
 def format_duration(seconds: float | None) -> str:
