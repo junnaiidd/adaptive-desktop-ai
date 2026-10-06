@@ -10,10 +10,13 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPushButton,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -27,7 +30,30 @@ from app.ui.context_inference_worker import ContextInferenceWorker
 from app.ui.context_observation_coordinator import ContextObservationCoordinator
 from app.ui.dashboard_controller import DashboardController
 from app.ui.monitoring_worker import MonitoringWorker
+from app.workspace.windows_workspace_adapter import (
+    ForegroundWindowProbe,
+    SubprocessExecutableLauncher,
+    WindowsExistingWindowFinder,
+    WindowsForegroundWindowProbe,
+    WindowsWindowActivator,
+)
+from app.workspace.workspace_restoration import WorkspaceRestorer
+from app.workspace.workspace_snapshot_store import WorkspaceSnapshotStore
 
+
+# Explicit minimum widths (px). Qt lays a widget out no narrower than its explicit minimum width, which
+# overrides the text-derived minimumSizeHint(); the widget still gets its full sizeHint() whenever there is
+# room. Without these, unwrappable text (and larger or wider fonts) set the page's minimum width and push it
+# past the 960px window minimum. The card values equal the natural minimums at the default font, so normal
+# layouts are unchanged; only stressed fonts clip, and they clip instead of overflowing the window.
+_MIN_CARD_WIDTHS = (162, 100, 100, 153)  # Current activity | Today | Session | Latest context
+_MIN_STATUS_WIDTH = 80
+_MIN_BUTTON_WIDTH = 120
+_MIN_TEXT_WIDTH = 120  # subtitle, footer
+
+# After the Capture click minimizes this window, Windows hands the foreground back to the app the
+# user was working in. Wait this long (non-blocking) for that hand-off before reading it.
+WORKSPACE_CAPTURE_FOCUS_DELAY_MS = 400
 
 # How often to look for newly completed sessions that have no context observation yet.
 CONTEXT_INFERENCE_INTERVAL_MS = 30_000
@@ -42,12 +68,27 @@ class MainWindow(QMainWindow):
         context_coordinator: ContextObservationCoordinator | None = None,
         work_thread_store: WorkThreadStore | None = None,
         task_store: TaskStore | None = None,
+        workspace_snapshot_store: WorkspaceSnapshotStore | None = None,
+        workspace_probe: ForegroundWindowProbe | None = None,
+        workspace_restorer: WorkspaceRestorer | None = None,
     ) -> None:
         super().__init__()
         self.controller = controller
         self.context_coordinator = context_coordinator or self._build_default_coordinator(controller)
         self.work_thread_store = work_thread_store or self._build_default_work_thread_store(controller)
         self.task_store = task_store or self._build_default_task_store(controller)
+        self.workspace_snapshot_store = (
+            workspace_snapshot_store or self._build_default_workspace_snapshot_store(controller)
+        )
+        controller.workspace_snapshot_store = self.workspace_snapshot_store
+        self.workspace_probe = workspace_probe or controller.workspace_probe or WindowsForegroundWindowProbe()
+        self.workspace_restorer = workspace_restorer or controller.workspace_restorer or WorkspaceRestorer(
+            WindowsExistingWindowFinder(), WindowsWindowActivator(), SubprocessExecutableLauncher()
+        )
+        controller.workspace_probe = self.workspace_probe
+        controller.workspace_restorer = self.workspace_restorer
+        self._workspace_capture_pending = False
+        self._workspace_capture_window_state = Qt.WindowState.WindowNoState
         self.worker: MonitoringWorker | None = None
         self.inference_worker: ContextInferenceWorker | None = None
         self.setWindowTitle("Adaptive Desktop AI")
@@ -108,6 +149,15 @@ class MainWindow(QMainWindow):
             controller.task_store = store
         return store
 
+    @staticmethod
+    def _build_default_workspace_snapshot_store(controller: DashboardController) -> WorkspaceSnapshotStore:
+        """Self-wire the isolated snapshot store to the same local database as its Work Threads."""
+        store = controller.workspace_snapshot_store
+        if store is None:
+            store = WorkspaceSnapshotStore(controller.repository.database_path)
+            controller.workspace_snapshot_store = store
+        return store
+
     def _build_ui(self) -> None:
         root = QWidget()
         root.setObjectName("root")
@@ -146,41 +196,64 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(34, 28, 34, 28)
         layout.setSpacing(18)
 
-        header = QHBoxLayout()
-        title_group = QVBoxLayout()
+        # Header geometry. The subtitle gets its own full-width row: sharing a row with the status and the
+        # monitoring button left it only (page width - status - button) pixels, which clipped it, while its
+        # unwrappable text width forced the whole page wider. Every text control below also declares an
+        # explicit minimum width (see _MIN_* constants), so no text length or font can widen the page.
+        header = QVBoxLayout()
+        title_row = QHBoxLayout()
         title = QLabel("Activity")
         title.setObjectName("pageTitle")
-        title_group.addWidget(title)
-        subtitle = QLabel("A private, local view of your observed desktop flow.")
-        subtitle.setObjectName("subtitle")
-        title_group.addWidget(subtitle)
-        header.addLayout(title_group)
-        header.addStretch()
+        title_row.addWidget(title)
+        title_row.addStretch()
         self.status = QLabel()
         self.status.setObjectName("status")
-        header.addWidget(self.status)
+        self.status.setMinimumWidth(_MIN_STATUS_WIDTH)
+        title_row.addWidget(self.status)
         self.toggle_button = QPushButton("Start monitoring")
+        self.toggle_button.setMinimumWidth(_MIN_BUTTON_WIDTH)
         self.toggle_button.clicked.connect(self.toggle_monitoring)
-        header.addWidget(self.toggle_button)
+        title_row.addWidget(self.toggle_button)
+        header.addLayout(title_row)
+        subtitle = QLabel("A private, local view of your observed desktop flow.")
+        subtitle.setObjectName("subtitle")
+        subtitle.setMinimumWidth(_MIN_TEXT_WIDTH)
+        header.addWidget(subtitle)
         layout.addLayout(header)
 
         cards = QHBoxLayout()
         cards.setSpacing(14)
-        self.current_card, self.current_values = _card("Current activity", ("Application", "Process", "Window title", "Duration"))
-        self.today_card, self.today_values = _card("Today", ("Observed", "Segments", "Sessions"))
-        self.session_card, self.session_values = _card("Session", ("Status", "Duration", "Activities"))
-        self.context_card, self.context_values = _card("Latest context", ("Context", "Session", "Observed"))
+        self.current_card, self.current_values = _card("Current activity", ("Application", "Process", "Window title", "Duration"), _MIN_CARD_WIDTHS[0])
+        self.today_card, self.today_values = _card("Today", ("Observed", "Segments", "Sessions"), _MIN_CARD_WIDTHS[1])
+        self.session_card, self.session_values = _card("Session", ("Status", "Duration", "Activities"), _MIN_CARD_WIDTHS[2])
+        self.context_card, self.context_values = _card("Latest context", ("Context", "Session", "Observed"), _MIN_CARD_WIDTHS[3])
         cards.addWidget(self.current_card, 2)
         cards.addWidget(self.today_card, 1)
         cards.addWidget(self.session_card, 1)
         cards.addWidget(self.context_card, 1)
         layout.addLayout(cards)
 
-        threads_panel = QFrame()
-        threads_panel.setObjectName("panel")
-        threads_layout = QVBoxLayout(threads_panel)
-        threads_layout.setContentsMargins(18, 16, 18, 14)
-        threads_layout.setSpacing(10)
+        # Lower area: two side-by-side panels. The page itself never scrolls; each panel owns its scrolling.
+        #   LEFT  work_panel  - Work threads / Tasks / Resume work / Unfinished work (scrolls internally)
+        #   RIGHT recent panel - Recent activity table (the table scrolls itself)
+        work_panel = QFrame()
+        work_panel.setObjectName("panel")
+        work_panel_layout = QVBoxLayout(work_panel)
+        work_panel_layout.setContentsMargins(0, 8, 4, 8)
+        work_panel_layout.setSpacing(0)
+        scroll_area = QScrollArea()
+        scroll_area.setObjectName("pageScroll")
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        # Horizontal scrolling only appears if the controls cannot fit (extreme fonts); never hide a control.
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll_content = QWidget()
+        scroll_content.setObjectName("pageScrollContent")
+        scroll_area.setWidget(scroll_content)
+        work_panel_layout.addWidget(scroll_area)
+        threads_layout = QVBoxLayout(scroll_content)
+        threads_layout.setContentsMargins(18, 8, 14, 6)
+        threads_layout.setSpacing(8)
 
         threads_title = QLabel("Work threads")
         threads_title.setObjectName("panelTitle")
@@ -192,24 +265,28 @@ class MainWindow(QMainWindow):
         self.thread_name_input = QLineEdit()
         self.thread_name_input.setPlaceholderText("New work thread name...")
         self.thread_name_input.returnPressed.connect(self._create_work_thread)
-        controls_row.addWidget(self.thread_name_input, 2)
+        controls_row.addWidget(self.thread_name_input, 1)
 
         self.create_thread_btn = QPushButton("Create thread")
         self.create_thread_btn.clicked.connect(self._create_work_thread)
         controls_row.addWidget(self.create_thread_btn)
 
+        select_row = QHBoxLayout()
+        select_row.setSpacing(10)
+
         self.thread_dropdown = QComboBox()
-        self.thread_dropdown.setMinimumWidth(200)
+        self.thread_dropdown.setMinimumWidth(120)
         self.thread_dropdown.currentIndexChanged.connect(self._on_thread_dropdown_changed)
-        controls_row.addWidget(self.thread_dropdown, 2)
+        select_row.addWidget(self.thread_dropdown, 1)
 
         self.associate_btn = QPushButton("Associate latest context")
         self.associate_btn.clicked.connect(self._associate_latest_context)
-        controls_row.addWidget(self.associate_btn)
+        select_row.addWidget(self.associate_btn)
 
         threads_layout.addLayout(controls_row)
+        threads_layout.addLayout(select_row)
 
-        self.thread_feedback = QLabel()
+        self.thread_feedback = _FeedbackLabel()
         self.thread_feedback.setObjectName("caption")
         threads_layout.addWidget(self.thread_feedback)
 
@@ -220,8 +297,9 @@ class MainWindow(QMainWindow):
         self.threads_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.threads_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.threads_table.horizontalHeader().setStretchLastSection(True)
-        self.threads_table.setColumnWidth(0, 60)
-        self.threads_table.setColumnWidth(1, 240)
+        self.threads_table.setColumnWidth(0, 50)
+        self.threads_table.setColumnWidth(1, 160)
+        self.threads_table.setMinimumHeight(110)
         self.threads_table.setMaximumHeight(110)
         self.threads_table.itemSelectionChanged.connect(self._on_thread_table_selection_changed)
         threads_layout.addWidget(self.threads_table)
@@ -229,6 +307,7 @@ class MainWindow(QMainWindow):
         # Tasks Section for selected Work Thread
         tasks_title = QLabel("Tasks")
         tasks_title.setObjectName("panelTitle")
+        threads_layout.addWidget(_divider())
         threads_layout.addWidget(tasks_title)
 
         task_controls_row = QHBoxLayout()
@@ -255,7 +334,7 @@ class MainWindow(QMainWindow):
 
         threads_layout.addLayout(task_controls_row)
 
-        self.task_feedback = QLabel()
+        self.task_feedback = _FeedbackLabel()
         self.task_feedback.setObjectName("caption")
         threads_layout.addWidget(self.task_feedback)
 
@@ -266,18 +345,46 @@ class MainWindow(QMainWindow):
         self.tasks_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tasks_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.tasks_table.horizontalHeader().setStretchLastSection(True)
-        self.tasks_table.setColumnWidth(0, 80)
-        self.tasks_table.setColumnWidth(1, 340)
+        self.tasks_table.setColumnWidth(0, 70)
+        self.tasks_table.setColumnWidth(1, 200)
+        self.tasks_table.setMinimumHeight(110)
         self.tasks_table.setMaximumHeight(110)
         self.tasks_table.itemSelectionChanged.connect(self._on_task_selection_changed)
         self.tasks_table.cellDoubleClicked.connect(lambda row, col: self._toggle_selected_task())
         threads_layout.addWidget(self.tasks_table)
+
+        workspace_title = QLabel("Resume work")
+        workspace_title.setObjectName("panelTitle")
+        threads_layout.addWidget(_divider())
+        threads_layout.addWidget(workspace_title)
+
+        workspace_controls = QHBoxLayout()
+        workspace_controls.setSpacing(10)
+        self.capture_workspace_btn = QPushButton("Capture current window")
+        self.capture_workspace_btn.clicked.connect(self._capture_workspace_snapshot)
+        workspace_controls.addWidget(self.capture_workspace_btn)
+        self.restore_workspace_btn = QPushButton("Restore latest snapshot")
+        self.restore_workspace_btn.clicked.connect(self._restore_workspace_snapshot)
+        self.restore_workspace_btn.setEnabled(False)
+        workspace_controls.addWidget(self.restore_workspace_btn)
+        workspace_controls.addStretch()
+        threads_layout.addLayout(workspace_controls)
+
+        self.workspace_snapshot_label = QLabel()
+        self.workspace_snapshot_label.setObjectName("caption")
+        self.workspace_snapshot_label.setWordWrap(True)
+        threads_layout.addWidget(self.workspace_snapshot_label)
+        self.workspace_feedback = _FeedbackLabel()
+        self.workspace_feedback.setObjectName("caption")
+        self.workspace_feedback.setWordWrap(True)
+        threads_layout.addWidget(self.workspace_feedback)
 
         # ------------------------------------------------------------------
         # Unfinished Work panel  (open tasks across all Work Threads)
         # ------------------------------------------------------------------
         unfinished_title = QLabel("Unfinished work")
         unfinished_title.setObjectName("panelTitle")
+        threads_layout.addWidget(_divider())
         threads_layout.addWidget(unfinished_title)
 
         unfinished_controls_row = QHBoxLayout()
@@ -298,7 +405,7 @@ class MainWindow(QMainWindow):
         unfinished_controls_row.addStretch()
         threads_layout.addLayout(unfinished_controls_row)
 
-        self.unfinished_feedback = QLabel()
+        self.unfinished_feedback = _FeedbackLabel()
         self.unfinished_feedback.setObjectName("caption")
         threads_layout.addWidget(self.unfinished_feedback)
 
@@ -309,14 +416,15 @@ class MainWindow(QMainWindow):
         self.unfinished_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.unfinished_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.unfinished_table.horizontalHeader().setStretchLastSection(True)
-        self.unfinished_table.setColumnWidth(0, 180)
-        self.unfinished_table.setColumnWidth(1, 300)
+        self.unfinished_table.setColumnWidth(0, 130)
+        self.unfinished_table.setColumnWidth(1, 170)
+        self.unfinished_table.setMinimumHeight(110)
         self.unfinished_table.setMaximumHeight(140)
         self.unfinished_table.itemSelectionChanged.connect(self._on_unfinished_selection_changed)
         self.unfinished_table.cellDoubleClicked.connect(lambda row, col: self._mark_open_task_done())
         threads_layout.addWidget(self.unfinished_table)
 
-        layout.addWidget(threads_panel)
+        threads_layout.addStretch()
 
         timeline_panel = QFrame()
         timeline_panel.setObjectName("panel")
@@ -331,15 +439,27 @@ class MainWindow(QMainWindow):
         self.timeline.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.timeline.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.timeline.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.timeline.horizontalHeader().setStretchLastSection(True)
-        self.timeline.setColumnWidth(0, 82)
-        self.timeline.setColumnWidth(1, 150)
-        self.timeline.setColumnWidth(2, 420)
+        timeline_header = self.timeline.horizontalHeader()
+        timeline_header.setStretchLastSection(False)
+        timeline_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        timeline_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        timeline_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        timeline_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.timeline.setColumnWidth(0, 70)
+        self.timeline.setColumnWidth(1, 110)
+        self.timeline.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.timeline.setMinimumHeight(110)
         timeline_layout.addWidget(self.timeline)
-        layout.addWidget(timeline_panel, 1)
+
+        lower_row = QHBoxLayout()
+        lower_row.setSpacing(14)
+        lower_row.addWidget(work_panel, 11)  # ~55%
+        lower_row.addWidget(timeline_panel, 9)  # ~45%
+        layout.addLayout(lower_row, 1)
 
         self.footer = QLabel()
         self.footer.setObjectName("footer")
+        self.footer.setMinimumWidth(_MIN_TEXT_WIDTH)
         layout.addWidget(self.footer)
         return page
 
@@ -409,6 +529,7 @@ class MainWindow(QMainWindow):
 
     def _on_thread_dropdown_changed(self) -> None:
         self._refresh_tasks()
+        self._refresh_workspace_snapshots()
 
     def _refresh_tasks(self) -> None:
         selected_thread_id = self.thread_dropdown.currentData()
@@ -499,6 +620,101 @@ class MainWindow(QMainWindow):
             self._refresh_tasks()
         except Exception as e:
             self.task_feedback.setText(f"Error deleting task: {e}")
+
+    def _refresh_workspace_snapshots(self) -> None:
+        selected_thread_id = self.thread_dropdown.currentData()
+        self._selected_workspace_snapshot_id: int | None = None
+        if selected_thread_id is None:
+            self.capture_workspace_btn.setEnabled(False)
+            self.restore_workspace_btn.setEnabled(False)
+            self.workspace_snapshot_label.setText("Select a Work Thread to capture a single foreground desktop app.")
+            return
+
+        self.capture_workspace_btn.setEnabled(not self._workspace_capture_pending)
+        snapshots = self.controller.list_workspace_snapshots(selected_thread_id)
+        if not snapshots:
+            self.restore_workspace_btn.setEnabled(False)
+            self.workspace_snapshot_label.setText(
+                "No snapshot yet. Capture is local and stores only the current app, executable path, and sanitized title."
+            )
+            return
+
+        latest = snapshots[-1]
+        self._selected_workspace_snapshot_id = latest.id
+        self.restore_workspace_btn.setEnabled(True)
+        title = latest.window_title or "No window title"
+        self.workspace_snapshot_label.setText(
+            f"Latest: {latest.application or latest.process_name} — {title}. "
+            "Restore activates a matching app or requests a no-argument launch."
+        )
+
+    def _capture_workspace_snapshot(self) -> None:
+        """Start an explicit capture: get out of the way so the user's previous app is foreground again.
+
+        Clicking the button made this window the foreground window, so reading the foreground now would
+        capture Adaptive Desktop AI itself. Minimize, wait (non-blocking) for Windows to hand focus back,
+        then capture in ``_finish_workspace_capture``.
+        """
+        selected_thread_id = self.thread_dropdown.currentData()
+        if selected_thread_id is None:
+            self.workspace_feedback.setText("Please select a Work Thread first.")
+            return
+        if self._workspace_capture_pending:
+            return
+        self._workspace_capture_pending = True
+        self.capture_workspace_btn.setEnabled(False)
+        self.workspace_feedback.setText("Capturing the application you were using…")
+        self._workspace_capture_window_state = self.windowState()
+        self.showMinimized()
+        QTimer.singleShot(
+            WORKSPACE_CAPTURE_FOCUS_DELAY_MS,
+            lambda thread_id=selected_thread_id: self._finish_workspace_capture(thread_id),
+        )
+
+    def _finish_workspace_capture(self, work_thread_id: int) -> None:
+        feedback: str
+        try:
+            snapshot = self.controller.capture_workspace_snapshot(work_thread_id)
+            if snapshot is None:
+                feedback = "Workspace capture is not configured."
+            else:
+                feedback = f"Captured {snapshot.application or snapshot.process_name} for this Work Thread."
+        except Exception as error:
+            feedback = f"Could not capture current window: {error}"
+        finally:
+            # Always bring the dashboard back, even if capture failed.
+            self._restore_window_after_workspace_capture()
+            self._workspace_capture_pending = False
+        self.workspace_feedback.setText(feedback)
+        self._refresh_workspace_snapshots()
+
+    def _restore_window_after_workspace_capture(self) -> None:
+        if self._workspace_capture_window_state & Qt.WindowState.WindowMaximized:
+            self.showMaximized()
+        else:
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _restore_workspace_snapshot(self) -> None:
+        snapshot_id = self._selected_workspace_snapshot_id
+        if snapshot_id is None:
+            return
+        response = QMessageBox.question(
+            self,
+            "Restore latest snapshot",
+            "Try to activate the matching app, or launch its captured executable with no arguments? "
+            "This cannot restore files, browser sessions, or unsaved state.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if response != QMessageBox.StandardButton.Yes:
+            return
+        result = self.controller.restore_workspace_snapshot(snapshot_id)
+        if result is None:
+            self.workspace_feedback.setText("Workspace restoration is not configured.")
+            return
+        self.workspace_feedback.setText(result.message)
 
     # ------------------------------------------------------------------
     # Unfinished Work handlers
@@ -655,6 +871,7 @@ class MainWindow(QMainWindow):
         self.thread_dropdown.blockSignals(False)
         self.associate_btn.setEnabled(len(threads) > 0 and snapshot.latest_context_observation_id is not None)
         self._refresh_tasks()
+        self._refresh_workspace_snapshots()
         self._refresh_unfinished(snapshot.open_tasks)
 
         self.footer.setText(f"{snapshot.polling_interval}  ·  Database {snapshot.database_status}")
@@ -673,9 +890,30 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-def _card(title: str, labels: tuple[str, ...]) -> tuple[QFrame, tuple[QLabel, ...]]:
+class _FeedbackLabel(QLabel):
+    """A caption label that takes no space while it has no text (keeps the Work panel compact)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setVisible(False)
+
+    def setText(self, text: str) -> None:  # noqa: N802 -- Qt override
+        super().setText(text)
+        self.setVisible(bool(text))
+
+
+def _divider() -> QFrame:
+    """A thin horizontal rule separating subsections inside the Work panel."""
+    line = QFrame()
+    line.setObjectName("divider")
+    line.setFixedHeight(1)
+    return line
+
+
+def _card(title: str, labels: tuple[str, ...], min_width: int) -> tuple[QFrame, tuple[QLabel, ...]]:
     card = QFrame()
     card.setObjectName("card")
+    card.setMinimumWidth(min_width)
     layout = QVBoxLayout(card)
     layout.setContentsMargins(18, 15, 18, 16)
     layout.setSpacing(5)
@@ -708,6 +946,19 @@ QLabel#status { color: #8893a2; padding: 7px 12px; }
 QLabel#status[running="true"] { color: #72dea0; }
 QPushButton { background: #3e82ca; color: white; border: 0; border-radius: 7px; padding: 9px 16px; font-weight: 600; }
 QPushButton:hover { background: #5597df; } QPushButton:disabled { background: #47515e; color: #a4acb8; }
+QScrollArea#pageScroll, QWidget#pageScrollContent { background: transparent; border: 0; }
+QScrollArea#pageScroll > QWidget > QWidget { background: transparent; }
+QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
+QScrollBar::handle:vertical { background: #2e3947; border-radius: 5px; min-height: 30px; }
+QScrollBar::handle:vertical:hover { background: #3e4c5e; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 0; }
+QScrollBar::handle:horizontal { background: #2e3947; border-radius: 5px; min-width: 30px; }
+QScrollBar::handle:horizontal:hover { background: #3e4c5e; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
+QFrame#divider { background: #27313e; border: 0; }
 QFrame#card, QFrame#panel { background: #171d26; border: 1px solid #27313e; border-radius: 10px; }
 QLabel#cardTitle, QLabel#panelTitle { font-size: 14px; font-weight: 650; color: #dce6f3; }
 QLabel#caption { color: #718094; font-size: 9px; letter-spacing: 0.8px; margin-top: 7px; }
