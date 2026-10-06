@@ -355,6 +355,71 @@ def test_controller_task_helpers_return_empty_or_none_without_task_store(tmp_pat
     controller.delete_task(1)  # must not raise
 
 
+# ============================================================================
+# Workspace Snapshot integration: explicit capture and best-effort restore
+# ============================================================================
+
+
+def test_controller_workspace_helpers_are_inert_without_workspace_services(tmp_path) -> None:
+    repository = ActivityRepository(tmp_path / "activity.db")
+    controller = DashboardController(repository, _service_stub())
+
+    assert controller.list_workspace_snapshots(1) == ()
+    assert controller.capture_workspace_snapshot(1) is None
+    assert controller.restore_workspace_snapshot(1) is None
+
+
+def test_controller_captures_and_restores_only_through_injected_workspace_ports(tmp_path) -> None:
+    from app.ml.work_thread_store import WorkThreadStore
+    from app.workspace.workspace_restoration import WorkspaceRestoreResult
+    from app.workspace.workspace_snapshot_store import CapturedForegroundWindow, WorkspaceSnapshotStore
+
+    class Probe:
+        def capture_foreground_window(self):
+            return CapturedForegroundWindow("Notepad", "notepad.exe", r"C:\\Windows\\notepad.exe", "Notes")
+
+    class Restorer:
+        def __init__(self):
+            self.snapshots = []
+
+        def restore(self, snapshot):
+            self.snapshots.append(snapshot)
+            return WorkspaceRestoreResult(True, "launch_executable", "Requested a no-argument application launch.")
+
+    database_path = tmp_path / "activity.db"
+    repository = ActivityRepository(database_path)
+    thread = WorkThreadStore(database_path).create_work_thread("Workspace", created_at=_now())
+    restorer = Restorer()
+    controller = DashboardController(
+        repository,
+        _service_stub(),
+        workspace_snapshot_store=WorkspaceSnapshotStore(database_path),
+        workspace_probe=Probe(),
+        workspace_restorer=restorer,
+    )
+
+    snapshot = controller.capture_workspace_snapshot(thread.id)
+    assert snapshot is not None
+    assert controller.list_workspace_snapshots(thread.id) == (snapshot,)
+    assert controller.restore_workspace_snapshot(snapshot.id).success is True
+    assert restorer.snapshots == [snapshot]
+
+
+def test_main_window_self_wires_workspace_snapshot_store_when_none_supplied(tmp_path) -> None:
+    from app.ui.main_window import MainWindow
+    from app.workspace.workspace_snapshot_store import WorkspaceSnapshotStore
+
+    database_path = tmp_path / "activity.db"
+    repository = ActivityRepository(database_path)
+    controller = DashboardController(repository, _service_stub())
+
+    store = MainWindow._build_default_workspace_snapshot_store(controller)
+
+    assert isinstance(store, WorkspaceSnapshotStore)
+    assert store.database_path == database_path
+    assert controller.workspace_snapshot_store is store
+
+
 def test_controller_create_list_toggle_delete_tasks(tmp_path) -> None:
     from app.ml.task_store import TaskStore
     from app.ml.work_thread_store import WorkThreadStore

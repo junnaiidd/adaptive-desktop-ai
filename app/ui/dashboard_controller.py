@@ -10,6 +10,9 @@ from app.database.activity_repository import ActivityRepository, StoredActivity,
 from app.ml.context_observation_store import ContextObservation, ContextObservationStore
 from app.ml.task_store import Task, TaskStore
 from app.ml.work_thread_store import WorkThread, WorkThreadObservation, WorkThreadStore
+from app.workspace.windows_workspace_adapter import ForegroundWindowProbe
+from app.workspace.workspace_restoration import WorkspaceRestoreResult, WorkspaceRestorer
+from app.workspace.workspace_snapshot_store import WorkspaceSnapshot, WorkspaceSnapshotStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,12 +63,18 @@ class DashboardController:
         context_observation_store: ContextObservationStore | None = None,
         work_thread_store: WorkThreadStore | None = None,
         task_store: TaskStore | None = None,
+        workspace_snapshot_store: WorkspaceSnapshotStore | None = None,
+        workspace_probe: ForegroundWindowProbe | None = None,
+        workspace_restorer: WorkspaceRestorer | None = None,
     ) -> None:
         self.repository = repository
         self.service = service
         self.context_observation_store = context_observation_store
         self.work_thread_store = work_thread_store
         self.task_store = task_store
+        self.workspace_snapshot_store = workspace_snapshot_store
+        self.workspace_probe = workspace_probe
+        self.workspace_restorer = workspace_restorer
 
     def snapshot(self, monitoring_running: bool) -> DashboardSnapshot:
         """Build a current dashboard snapshot from the local repository and service."""
@@ -159,6 +168,30 @@ class DashboardController:
         """Delete a task if task store is configured."""
         if self.task_store is not None:
             self.task_store.delete_task(task_id)
+
+    def list_workspace_snapshots(self, work_thread_id: int) -> tuple[WorkspaceSnapshot, ...]:
+        """List explicitly captured snapshots for one Work Thread, or none when unconfigured."""
+        if self.workspace_snapshot_store is None:
+            return ()
+        return tuple(self.workspace_snapshot_store.list_snapshots_for_work_thread(work_thread_id))
+
+    def capture_workspace_snapshot(self, work_thread_id: int) -> WorkspaceSnapshot | None:
+        """Capture the foreground app only after the UI receives an explicit user request."""
+        if self.workspace_snapshot_store is None or self.workspace_probe is None:
+            return None
+        captured_window = self.workspace_probe.capture_foreground_window()
+        return self.workspace_snapshot_store.create_snapshot(
+            work_thread_id, captured_window, captured_at=datetime.now(timezone.utc)
+        )
+
+    def restore_workspace_snapshot(self, snapshot_id: int) -> WorkspaceRestoreResult | None:
+        """Run a best-effort restore only after the UI confirms an explicit user request."""
+        if self.workspace_snapshot_store is None or self.workspace_restorer is None:
+            return None
+        snapshot = self.workspace_snapshot_store.get_snapshot(snapshot_id)
+        if snapshot is None:
+            return None
+        return self.workspace_restorer.restore(snapshot)
 
     def list_open_tasks(self) -> tuple[tuple[WorkThread, tuple[Task, ...]], ...]:
         """
