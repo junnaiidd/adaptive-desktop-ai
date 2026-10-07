@@ -28,7 +28,7 @@ from app.ml.task_store import TaskStore
 from app.ml.work_thread_store import WorkThreadStore
 from app.ui.context_inference_worker import ContextInferenceWorker
 from app.ui.context_observation_coordinator import ContextObservationCoordinator
-from app.ui.dashboard_controller import DashboardController
+from app.ui.dashboard_controller import DashboardController, describe_work_thread_history
 from app.ui.monitoring_worker import MonitoringWorker
 from app.workspace.windows_workspace_adapter import (
     ForegroundWindowProbe,
@@ -88,6 +88,7 @@ class MainWindow(QMainWindow):
         controller.workspace_probe = self.workspace_probe
         controller.workspace_restorer = self.workspace_restorer
         self._workspace_capture_pending = False
+        self._thread_history_key: tuple | None = None  # (thread id, stamp) of the history currently shown
         self._workspace_capture_window_state = Qt.WindowState.WindowNoState
         self.worker: MonitoringWorker | None = None
         self.inference_worker: ContextInferenceWorker | None = None
@@ -285,6 +286,13 @@ class MainWindow(QMainWindow):
 
         threads_layout.addLayout(controls_row)
         threads_layout.addLayout(select_row)
+
+        # Compact, read-only history of the selected Work Thread (composed from persisted data; see
+        # WorkThreadHistoryReader). Hidden while there is nothing to show.
+        self.thread_history_label = _FeedbackLabel()
+        self.thread_history_label.setObjectName("caption")
+        self.thread_history_label.setWordWrap(True)
+        threads_layout.addWidget(self.thread_history_label)
 
         self.thread_feedback = _FeedbackLabel()
         self.thread_feedback.setObjectName("caption")
@@ -530,6 +538,7 @@ class MainWindow(QMainWindow):
     def _on_thread_dropdown_changed(self) -> None:
         self._refresh_tasks()
         self._refresh_workspace_snapshots()
+        self._refresh_thread_history()
 
     def _refresh_tasks(self) -> None:
         selected_thread_id = self.thread_dropdown.currentData()
@@ -620,6 +629,21 @@ class MainWindow(QMainWindow):
             self._refresh_tasks()
         except Exception as e:
             self.task_feedback.setText(f"Error deleting task: {e}")
+
+    def _refresh_thread_history(self) -> None:
+        """Show the selected Work Thread's history; rebuild it only when one of its inputs changed."""
+        selected_thread_id = self.thread_dropdown.currentData()
+        if selected_thread_id is None:
+            self._thread_history_key = None
+            self.thread_history_label.setText("")
+            return
+
+        key = (selected_thread_id, self.controller.work_thread_history_stamp(selected_thread_id))
+        if key == self._thread_history_key:
+            return
+        history = self.controller.work_thread_history(selected_thread_id)
+        self.thread_history_label.setText(describe_work_thread_history(history) if history is not None else "")
+        self._thread_history_key = key
 
     def _refresh_workspace_snapshots(self) -> None:
         selected_thread_id = self.thread_dropdown.currentData()
@@ -872,6 +896,7 @@ class MainWindow(QMainWindow):
         self.associate_btn.setEnabled(len(threads) > 0 and snapshot.latest_context_observation_id is not None)
         self._refresh_tasks()
         self._refresh_workspace_snapshots()
+        self._refresh_thread_history()
         self._refresh_unfinished(snapshot.open_tasks)
 
         self.footer.setText(f"{snapshot.polling_interval}  ·  Database {snapshot.database_status}")

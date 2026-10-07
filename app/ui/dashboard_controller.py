@@ -10,6 +10,7 @@ from app.database.activity_repository import ActivityRepository, StoredActivity,
 from app.ml.context_observation_store import ContextObservation, ContextObservationStore
 from app.ml.task_store import Task, TaskStore
 from app.ml.work_thread_store import WorkThread, WorkThreadObservation, WorkThreadStore
+from app.ml.work_thread_history import WorkThreadHistory, WorkThreadHistoryReader
 from app.workspace.windows_workspace_adapter import ForegroundWindowProbe
 from app.workspace.workspace_restoration import WorkspaceRestoreResult, WorkspaceRestorer
 from app.workspace.workspace_snapshot_store import WorkspaceSnapshot, WorkspaceSnapshotStore
@@ -193,6 +194,47 @@ class DashboardController:
             return None
         return self.workspace_restorer.restore(snapshot)
 
+    def work_thread_history(self, work_thread_id: int) -> WorkThreadHistory | None:
+        """
+        Compose the persisted history of one Work Thread from the stores this controller already holds.
+
+        Returns ``None`` when the Work Thread or observation store is absent, or the thread does not exist.
+        The history is rebuilt from the database on every call; nothing is cached or copied.
+        """
+        if self.work_thread_store is None or self.context_observation_store is None:
+            return None
+        reader = WorkThreadHistoryReader(
+            self.work_thread_store,
+            self.context_observation_store,
+            task_store=self.task_store,
+            activity_repository=self.repository,
+            workspace_snapshot_store=self.workspace_snapshot_store,
+        )
+        return reader.get_history(work_thread_id)
+
+    def work_thread_history_stamp(self, work_thread_id: int) -> tuple | None:
+        """
+        A cheap fingerprint of the user-changeable inputs to a Work Thread's history.
+
+        The dashboard refreshes every second; it compares this stamp and only rebuilds the full history when
+        it changes. Covers associations, task states and workspace snapshots. Returns ``None`` when the
+        Work Thread store is absent.
+        """
+        if self.work_thread_store is None:
+            return None
+        associations = len(self.work_thread_store.list_observations_for_work_thread(work_thread_id))
+        tasks = (
+            tuple((t.id, t.is_done) for t in self.task_store.list_tasks_for_work_thread(work_thread_id))
+            if self.task_store is not None
+            else ()
+        )
+        snapshots = (
+            tuple(s.id for s in self.workspace_snapshot_store.list_snapshots_for_work_thread(work_thread_id))
+            if self.workspace_snapshot_store is not None
+            else ()
+        )
+        return associations, tasks, snapshots
+
     def list_open_tasks(self) -> tuple[tuple[WorkThread, tuple[Task, ...]], ...]:
         """
         Return all incomplete tasks across every Work Thread, grouped by thread.
@@ -301,3 +343,51 @@ def _session_activity_count(current_session, activities: list[StoredActivity]) -
         return 0
     completed = sum(item.session_id == current_session.id for item in activities)
     return completed + (1 if current_session is not None else 0)
+
+
+_HISTORY_CONTEXTS_SHOWN = 3
+_HISTORY_APPLICATIONS_SHOWN = 3
+
+
+def describe_work_thread_history(history: WorkThreadHistory) -> str:
+    """
+    A compact (at most three lines) description of a Work Thread's history for the dashboard.
+
+    Only facts that are actually known are mentioned: a missing source or an empty collection produces no
+    text, never a placeholder or a guess.
+    """
+    lines: list[str] = []
+
+    if history.context_history:
+        labels = [entry.label for entry in history.context_history]
+        text = ", ".join(labels[:_HISTORY_CONTEXTS_SHOWN])
+        hidden = len(labels) - _HISTORY_CONTEXTS_SHOWN
+        lines.append(f"Contexts: {text}" + (f" (+{hidden} more)" if hidden > 0 else ""))
+
+    parts: list[str] = []
+    if history.associated_observation_count:
+        parts.append(_plural(history.session_count, "session"))
+        parts.append(_plural(history.associated_observation_count, "linked observation"))
+    else:
+        parts.append("No linked observations yet")
+    if history.open_task_count is not None and history.completed_task_count is not None:
+        if history.open_task_count + history.completed_task_count > 0:
+            parts.append(f"{history.open_task_count} open / {history.completed_task_count} done tasks")
+    lines.append(" · ".join(parts))
+
+    details: list[str] = []
+    if history.recent_applications:
+        names = [app.name for app in history.recent_applications[:_HISTORY_APPLICATIONS_SHOWN]]
+        details.append("Recent: " + ", ".join(names))
+    if history.last_activity_at is not None:
+        details.append("last active " + history.last_activity_at.astimezone().strftime("%Y-%m-%d %H:%M"))
+    if history.has_workspace_snapshot:
+        details.append("workspace snapshot saved")
+    if details:
+        lines.append(" · ".join(details))
+
+    return "\n".join(lines)
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" + ("" if count == 1 else "s")
